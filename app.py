@@ -1,122 +1,138 @@
-# app.py
-
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, redirect, url_for
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from werkzeug.exceptions import HTTPException # <-- Import this
+from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
 import bcrypt
-import os
+from datetime import timedelta
+# NOTE: You must also import 'os' and 'secrets' if you are using 'os.environ' for the secret key
 
-# --- Configuration ---
+# --- CONFIGURATION ---
 app = Flask(__name__)
+CORS(app, supports_credentials=True)
 
-# 1. Use environment variable for the SECRET_KEY (MANDATORY for security)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'default_dev_key_if_not_set')
-
-# 2. Database Configuration for Production (Render)
-# Recommended to use PostgreSQL for Render deployment, but sticking to SQLite for initial setup.
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///users.db')
+# !!! IMPORTANT: Fetch from environment variables on Render !!!
+app.config['SECRET_KEY'] = 'YOUR_SUPER_SECRET_KEY_HERE_CHANGE_ME_NOW'  # Replace with os.environ.get('SECRET_KEY')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///rajesh_opticals.db' # Replace with os.environ.get('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Setup CORS to allow your frontend to access the API
-CORS(app, supports_credentials=True, origins=["https://rajesh-backend-72q8.onrender.com", "http://localhost:5500", "YOUR_FRONTEND_DOMAIN_HERE"])
+# Set the session cookie to expire after 100 days (or more)
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=100) # For persistent login
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=100) # For standard session
 
 db = SQLAlchemy(app)
 
-# --- GLOBAL ERROR HANDLER (Prevents the '<!doctype' error) ---
-@app.errorhandler(HTTPException)
-def handle_exception(e):
-    """Return JSON instead of HTML for HTTP errors."""
-    return jsonify({
-        'ok': False,
-        'msg': e.description or 'A server error occurred.',
-        'code': e.code
-    }), e.code
+# --- FLASK-LOGIN SETUP ---
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login' # Define the view Flask-Login redirects to
 
-# --- Database Model (User Schema) ---
-class User(db.Model):
+# This function tells Flask-Login how to load a user object from the database
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# --- DATABASE MODELS ---
+# UserMixin provides methods like is_authenticated, is_active, get_id() needed by Flask-Login
+class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     fullname = db.Column(db.String(100), nullable=False)
-    phone = db.Column(db.String(20), unique=True, nullable=False)
-    email = db.Column(db.String(100), unique=True, nullable=False)
+    phone = db.Column(db.String(15), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.LargeBinary, nullable=False)
-    role = db.Column(db.String(10), default='Staff')
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(20), nullable=False, default='Staff')
+    
+    def set_password(self, password):
+        self.password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-# Create the database tables
-with app.app_context():
-    db.create_all()
+    def check_password(self, password):
+        # NOTE: bcrypt.checkpw automatically handles the salt
+        return bcrypt.checkpw(password.encode('utf-8'), self.password_hash)
 
-# --- 1. SIGNUP Route (/signup) ---
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+# (You can add your other models like Customer, Order, etc. here)
+
+
+# --- ROUTES ---
+
+# SIGNUP ROUTE
 @app.route('/signup', methods=['POST'])
 def signup():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    # ... (other data: fullname, phone, email, role)
+
+    if not all([username, password]):
+        return jsonify({'ok': False, 'msg': 'Missing required fields'}), 400
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({'ok': False, 'msg': 'Username already exists'}), 409
+
+    new_user = User(
+        fullname=data.get('fullname'),
+        phone=data.get('phone'),
+        email=data.get('email'),
+        username=username,
+        role=data.get('role', 'Staff')
+    )
+    new_user.set_password(password)
+    
     try:
-        data = request.get_json()
-        fullname = data.get('fullname')
-        phone = data.get('phone')
-        email = data.get('email')
-        username = data.get('username')
-        password = data.get('password')
-        role = data.get('role', 'Staff')
-
-        if not all([fullname, phone, email, username, password]):
-            return jsonify({'ok': False, 'msg': 'All fields are required!'}), 400
-
-        if User.query.filter_by(username=username).first() or User.query.filter_by(phone=phone).first():
-            return jsonify({'ok': False, 'msg': 'Username or Phone already exists.'}), 409
-
-        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-        new_user = User(fullname=fullname, phone=phone, email=email, username=username, password_hash=hashed_password, role=role)
-        
         db.session.add(new_user)
         db.session.commit()
-        
-        # Set session only after successful signup
-        session['user_id'] = new_user.id 
-        
-        return jsonify({'ok': True, 'msg': 'Signup successful! Redirecting to Home.'}), 201
+        return jsonify({'ok': True, 'msg': 'User registered successfully!'}), 201
     except Exception as e:
         db.session.rollback()
-        # Handle unspecific server errors, ensuring JSON is returned
-        return jsonify({'ok': False, 'msg': f'Internal Server Error during signup: {str(e)}'}), 500
+        return jsonify({'ok': False, 'msg': f'Database error: {str(e)}'}), 500
 
 
-# --- 2. LOGIN Route (/login) ---
+# LOGIN ROUTE (The change for permanent login is here)
 @app.route('/login', methods=['POST'])
 def login():
-    try:
-        data = request.get_json()
-        username_or_phone = data.get('username') 
-        password = data.get('password')
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    # The frontend only sends username/phone and password, but the backend must check both fields.
+    
+    # Try to find user by username or phone
+    user = User.query.filter((User.username == username) | (User.phone == username)).first()
 
-        if not all([username_or_phone, password]):
-            return jsonify({'ok': False, 'msg': 'Username and Password are required!'}), 400
-
-        # Find user by username OR phone number
-        user = User.query.filter((User.username == username_or_phone) | (User.phone == username_or_phone)).first()
-
-        if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash):
-            # Successful Login: Set session cookie
-            session['user_id'] = user.id
-            session['role'] = user.role
-            return jsonify({'ok': True, 'msg': f'Login successful! Role: {user.role}'}), 200
-        else:
-            return jsonify({'ok': False, 'msg': 'Invalid Username or Password'}), 401
-    except Exception as e:
-        return jsonify({'ok': False, 'msg': f'Internal Server Error during login: {str(e)}'}), 500
-
-# --- 3. LOGOUT Route ---
-@app.route('/logout')
-def logout():
-    session.pop('user_id', None)
-    session.pop('role', None)
-    return jsonify({'ok': True, 'msg': 'Logged out successfully.'}), 200
-
-# --- 4. Protected Route Example (for checking session status) ---
-@app.route('/check_auth')
-def check_auth():
-    if 'user_id' in session:
-        return jsonify({'ok': True, 'user_id': session['user_id'], 'role': session['role']}), 200
+    if user and user.check_password(password):
+        # The magic line for PERMANENT login!
+        # Flask-Login sets a special, long-lasting cookie (max_age is set by REMEMBER_COOKIE_DURATION)
+        login_user(user, remember=True) 
+        
+        # You can still use the standard session to store extra info if needed
+        session['role'] = user.role 
+        
+        return jsonify({'ok': True, 'msg': f'Login successful! Role: {user.role}'}), 200
     else:
-        # User not logged in
-        return jsonify({'ok': False, 'msg': 'Not authenticated'}), 401
+        return jsonify({'ok': False, 'msg': 'Invalid credentials'}), 401
+
+
+# LOGOUT ROUTE
+@app.route('/logout')
+@login_required # Ensure only logged-in users can logout
+def logout():
+    # Flask-Login removes the session and the long-term 'remember me' cookie.
+    logout_user() 
+    return jsonify({'ok': True, 'msg': 'Logged out successfully'}), 200
+
+# PROTECTED ROUTE Example
+@app.route('/dashboard_data')
+@login_required # This is how you protect any route!
+def dashboard_data():
+    return jsonify({
+        'user': current_user.username,
+        'role': current_user.role,
+        'data': 'Your secure dashboard data here.'
+    }), 200
+
+# --- APP STARTUP ---
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
