@@ -3,36 +3,54 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
 import bcrypt
+import os # NEW: Required for reading environment variables
 from datetime import timedelta
-# NOTE: You must also import 'os' and 'secrets' if you are using 'os.environ' for the secret key
 
 # --- CONFIGURATION ---
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
 
-# !!! IMPORTANT: Fetch from environment variables on Render !!!
-app.config['SECRET_KEY'] = 'YOUR_SUPER_SECRET_KEY_HERE_CHANGE_ME_NOW'  # Replace with os.environ.get('SECRET_KEY')
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///rajesh_opticals.db' # Replace with os.environ.get('DATABASE_URL')
+# !!! CRITICAL FOR SECURITY AND DEPLOYMENT !!!
+# Read SECRET_KEY from Render environment variable. 
+# The default is ONLY for local testing if the variable isn't set.
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'FALLBACK_INSECURE_DEV_KEY_CHANGE_ME_NOW')
+
+# Database configuration (Use a proper DATABASE_URL from Render for production)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///rajesh_opticals.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Set the session cookie to expire after 100 days (or more)
-app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=100) # For persistent login
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=100) # For standard session
+# Set the session cookie to expire after 100 days for permanent login
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=100)
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=100)
+
+# --- CORS FIX (Allows your local HTML/JS to talk to the Render API) ---
+# List ALL domains/origins that are allowed to talk to your API.
+ALLOWED_ORIGINS = [
+    "http://localhost",               # For testing with local servers
+    "http://127.0.0.1",               # Another common local address
+    "http://localhost:5500",          # Common port for VS Code Live Server
+    "file://",                        # Allows requests from local HTML files (less secure, but fixes your current issue)
+    "https://rajesh-backend-optical-1.onrender.com", # Your own backend URL (Render)
+    "https://your-future-frontend-domain.com", # Replace this with your final frontend URL
+]
+
+# Note: supports_credentials=True is essential for sending cookies (sessions/login)
+CORS(app, supports_credentials=True, origins=ALLOWED_ORIGINS) 
+# --- END CORS FIX ---
+
 
 db = SQLAlchemy(app)
 
 # --- FLASK-LOGIN SETUP ---
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = 'login' # Define the view Flask-Login redirects to
+login_manager.login_view = 'login'
 
-# This function tells Flask-Login how to load a user object from the database
 @login_manager.user_loader
 def load_user(user_id):
+    """Required by Flask-Login to load a user from the ID stored in the session/cookie."""
     return User.query.get(int(user_id))
 
 # --- DATABASE MODELS ---
-# UserMixin provides methods like is_authenticated, is_active, get_id() needed by Flask-Login
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     fullname = db.Column(db.String(100), nullable=False)
@@ -52,8 +70,6 @@ class User(UserMixin, db.Model):
     def __repr__(self):
         return f'<User {self.username}>'
 
-# (You can add your other models like Customer, Order, etc. here)
-
 
 # --- ROUTES ---
 
@@ -63,13 +79,13 @@ def signup():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    # ... (other data: fullname, phone, email, role)
+    
+    if not all([data.get('fullname'), data.get('phone'), data.get('email'), username, password]):
+        return jsonify({'ok': False, 'msg': 'All fields are required!'}), 400
 
-    if not all([username, password]):
-        return jsonify({'ok': False, 'msg': 'Missing required fields'}), 400
-
-    if User.query.filter_by(username=username).first():
-        return jsonify({'ok': False, 'msg': 'Username already exists'}), 409
+    # Check for existing user (username or phone)
+    if User.query.filter((User.username == username) | (User.phone == data.get('phone'))).first():
+        return jsonify({'ok': False, 'msg': 'Username or Phone already exists.'}), 409
 
     new_user = User(
         fullname=data.get('fullname'),
@@ -83,56 +99,59 @@ def signup():
     try:
         db.session.add(new_user)
         db.session.commit()
-        return jsonify({'ok': True, 'msg': 'User registered successfully!'}), 201
+        # Optional: Log the user in immediately after signup
+        login_user(new_user, remember=True) 
+        session['role'] = new_user.role
+        return jsonify({'ok': True, 'msg': 'Signup successful! Redirecting to Home.'}), 201
     except Exception as e:
         db.session.rollback()
-        return jsonify({'ok': False, 'msg': f'Database error: {str(e)}'}), 500
+        # Log the full error to the server console for debugging
+        print(f"Signup error: {e}") 
+        return jsonify({'ok': False, 'msg': f'Internal Server Error during signup.'}), 500
 
 
-# LOGIN ROUTE (The change for permanent login is here)
+# LOGIN ROUTE (Uses remember=True for permanent login)
 @app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    username = data.get('username')
+    username_or_phone = data.get('username')
     password = data.get('password')
-    # The frontend only sends username/phone and password, but the backend must check both fields.
+    
+    if not all([username_or_phone, password]):
+        return jsonify({'ok': False, 'msg': 'Username and Password are required!'}), 400
     
     # Try to find user by username or phone
-    user = User.query.filter((User.username == username) | (User.phone == username)).first()
+    user = User.query.filter((User.username == username_or_phone) | (User.phone == username_or_phone)).first()
 
     if user and user.check_password(password):
-        # The magic line for PERMANENT login!
-        # Flask-Login sets a special, long-lasting cookie (max_age is set by REMEMBER_COOKIE_DURATION)
+        # PERMANENT LOGIN FIX: 'remember=True' tells Flask-Login to set the long-lasting cookie.
         login_user(user, remember=True) 
-        
-        # You can still use the standard session to store extra info if needed
-        session['role'] = user.role 
+        session['role'] = user.role # Store role in session for easy access
         
         return jsonify({'ok': True, 'msg': f'Login successful! Role: {user.role}'}), 200
     else:
-        return jsonify({'ok': False, 'msg': 'Invalid credentials'}), 401
+        return jsonify({'ok': False, 'msg': 'Invalid Username or Password'}), 401
 
 
 # LOGOUT ROUTE
 @app.route('/logout')
-@login_required # Ensure only logged-in users can logout
+@login_required # Ensures only an authenticated user can perform this action
 def logout():
     # Flask-Login removes the session and the long-term 'remember me' cookie.
     logout_user() 
     return jsonify({'ok': True, 'msg': 'Logged out successfully'}), 200
 
 # PROTECTED ROUTE Example
-@app.route('/dashboard_data')
-@login_required # This is how you protect any route!
-def dashboard_data():
-    return jsonify({
-        'user': current_user.username,
-        'role': current_user.role,
-        'data': 'Your secure dashboard data here.'
-    }), 200
+@app.route('/check_auth')
+def check_auth():
+    """Checks if the user is currently logged in (either via short session or long-term cookie)."""
+    if current_user.is_authenticated:
+        return jsonify({'ok': True, 'user_id': current_user.id, 'username': current_user.username, 'role': session.get('role', 'Unknown')}), 200
+    else:
+        return jsonify({'ok': False, 'msg': 'Not authenticated'}), 401
 
 # --- APP STARTUP ---
 if __name__ == '__main__':
     with app.app_context():
-        db.create_all()
+        db.create_all() # Creates tables if they don't exist
     app.run(debug=True)
